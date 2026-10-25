@@ -305,3 +305,72 @@ impl Launcher {
             }
         }
     }
+
+    // -- server control -----------------------------------------------------
+
+    fn start(&mut self, open_game: bool) {
+        if self.busy || self.host.is_some() {
+            return;
+        }
+        if let Err(fault) = self.folder_state() {
+            self.fail(fault);
+            return;
+        }
+        self.busy = true;
+        self.set_status(Level::Busy, "Starting server…");
+        let tx = self.tx.clone();
+        let folder = PathBuf::from(&self.folder);
+        let mut settings = self.settings.clone();
+        let quick_tunnel = settings.cloudflare_tunnel && settings.mode == "external";
+        let code = self.code.clone();
+        self.runtime.as_ref().unwrap().spawn(async move {
+            let result = async {
+                let previous = settings.clone();
+                if quick_tunnel {
+                    settings.https = false;
+                    settings.public_origin = "https://pending.invalid".into();
+                }
+                // Own the listener before publishing a tunnel, so a busy port cannot expose another app.
+                let mut host = server::start(&folder, settings, &code).await?;
+                let tunnel = if quick_tunnel {
+                    match tunnel::start(host.port()).await {
+                        Ok(tunnel) => {
+                            if let Err(error) = host.set_public_origin(&tunnel.origin) {
+                                tunnel.stop().await;
+                                host.stop().await;
+                                let _ = previous.save(&config::resolve_folder(&folder)?);
+                                return Err(error);
+                            }
+                            Some(tunnel)
+                        }
+                        Err(error) => {
+                            host.stop().await;
+                            let _ = previous.save(&config::resolve_folder(&folder)?);
+                            return Err(error);
+                        }
+                    }
+                } else {
+                    None
+                };
+                Ok((host, tunnel))
+            }
+            .await;
+            let _ = tx.send(Event::Started(result, open_game));
+        });
+    }
+
+    fn stop(&mut self) {
+        if let Some(host) = self.host.take() {
+            let tunnel = self.tunnel.take();
+            self.busy = true;
+            self.set_status(Level::Busy, "Stopping server…");
+            let tx = self.tx.clone();
+            self.runtime.as_ref().unwrap().spawn(async move {
+                if let Some(tunnel) = tunnel {
+                    tunnel.stop().await;
+                }
+                host.stop().await;
+                let _ = tx.send(Event::Stopped);
+            });
+        }
+    }
