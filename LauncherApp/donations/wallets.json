@@ -1,28 +1,26 @@
-{
-  "wallets": [
-    {
-      "id": "solana",
-      "name": "Solana",
-      "symbol": "SOL",
-      "address": ""
-    },
-    {
-      "id": "bitcoin",
-      "name": "Bitcoin",
-      "symbol": "BTC",
-      "address": ""
-    },
-    {
-      "id": "ethereum",
-      "name": "Ethereum",
-      "symbol": "ETH",
-      "address": ""
-    },
-    {
-      "id": "monero",
-      "name": "Monero",
-      "symbol": "XMR",
-      "address": ""
-    }
-  ]
-}
+[
+  {
+    "id": "solana",
+    "name": "Solana",
+    "symbol": "SOL",
+    "address": ""
+  },
+  {
+    "id": "bitcoin",
+    "name": "Bitcoin",
+    "symbol": "BTC",
+    "address": ""
+  },
+  {
+    "id": "ethereum",
+    "name": "Ethereum",
+    "symbol": "ETH",
+    "address": ""
+  },
+  {
+    "id": "monero",
+    "name": "Monero",
+    "symbol": "XMR",
+    "address": ""
+  }
+]
