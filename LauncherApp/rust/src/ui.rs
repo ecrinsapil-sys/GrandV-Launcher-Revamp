@@ -47,3 +47,20 @@ enum Tab {
     Network = 2,
     Help = 3,
 }
+
+impl Tab {
+    const ALL: [Tab; 4] = [Tab::Game, Tab::Server, Tab::Network, Tab::Help];
+
+    fn label(self) -> &'static str {
+        match self {
+            Tab::Game => "Game",
+            Tab::Server => "Server",
+            Tab::Network => "Network",
+            Tab::Help => "Help",
+        }
+    }
+
+    fn from_index(index: usize) -> Self {
+        Self::ALL.get(index).copied().unwrap_or(Tab::Game)
+    }
+}
