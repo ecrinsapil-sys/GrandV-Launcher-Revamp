@@ -1,308 +1,360 @@
-                                .desired_width(ui.available_width() - 130.),
-                        );
-                        if theme::button_w(ui, "Browse…", 110.).clicked() {
-                            Self::pick_pem(value);
-                        }
-                    });
-                }
+//! Interface for the GrandV backend launcher.
+//!
+//! Layout: a fixed header with the game-folder picker and the primary actions,
+//! then a tab bar, then the active tab's content. Every colour and size comes
+//! from `crate::theme`, and every failure is rendered through `crate::errors`.
 
-                ui.add_space(theme::SPACE_S);
-                if theme::button_w(ui, "Create / renew LAN certificate", 260.).clicked() {
-                    match config::resolve_folder(&PathBuf::from(&self.folder)) {
-                        Ok(folder) => {
-                            self.busy = true;
-                            self.set_status(Level::Busy, "Creating the LAN certificate…");
-                            let tx = self.tx.clone();
-                            self.runtime.as_ref().unwrap().spawn(async move {
-                                let result =
-                                    tokio::task::spawn_blocking(move || tls::generate(&folder))
-                                        .await
-                                        .map_err(anyhow::Error::from)
-                                        .and_then(|v| v);
-                                let _ = tx.send(Event::Certificate(result));
-                            });
+use crate::errors::{Fault, Remedy, GUIDE};
+use crate::theme::{self, Level};
+use eframe::egui;
+use gta_browser_launcher::{
+    config::{self, Settings},
+    discovery::{self, Found},
+    server::{self, Running},
+    tls, tunnel,
+};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::{
+    path::PathBuf,
+    sync::mpsc,
+    time::{Duration, Instant},
+};
+
+struct ConsoleWindow {
+    open: AtomicBool,
+    follow: AtomicBool,
+    screenshot_requested: AtomicBool,
+}
+
+enum Event {
+    Started(anyhow::Result<(Running, Option<tunnel::Tunnel>)>, bool),
+    Stopped,
+    Found(anyhow::Result<Vec<Found>>),
+    Certificate(anyhow::Result<(String, String)>),
+}
+
+// ---------------------------------------------------------------------------
+// Tabs
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Tab {
+    Game = 0,
+    Server = 1,
+    Network = 2,
+    Help = 3,
+}
+
+impl Tab {
+    const ALL: [Tab; 4] = [Tab::Game, Tab::Server, Tab::Network, Tab::Help];
+
+    fn label(self) -> &'static str {
+        match self {
+            Tab::Game => "Game",
+            Tab::Server => "Server",
+            Tab::Network => "Network",
+            Tab::Help => "Help",
+        }
+    }
+
+    fn from_index(index: usize) -> Self {
+        Self::ALL.get(index).copied().unwrap_or(Tab::Game)
+    }
+}
+
+const ASSET_TORRENT_URL: &str = concat!(
+    "magnet:?xt=urn:btih:60a2d95f23154e4f7c75a965307133c24d9c7178&dn=GrandV-assets",
+    "&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce",
+    "&tr=udp%3A%2F%2Ftracker.torrent.eu.org%3A451",
+    "&tr=http%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce",
+    "&tr=udp%3A%2F%2Fopen.stealth.si%3A80%2Fannounce",
+    "&tr=http%3A%2F%2Ftracker.qu.ax%3A6969%2Fannounce",
+    "&tr=udp%3A%2F%2Ftracker.skynetcloud.site%3A6969%2Fannounce",
+    "&tr=udp%3A%2F%2Ftracker.denness.net%3A6969%2Fannounce",
+    "&tr=udp%3A%2F%2Ftracker.qu.ax%3A6969%2Fannounce",
+    "&tr=udp%3A%2F%2Ftracker.ducks.party%3A1984%2Fannounce",
+    "&tr=udp%3A%2F%2Ftracker.tryhackx.org%3A6969%2Fannounce",
+    "&tr=udp%3A%2F%2Ftracker.corpscorp.online%3A80%2Fannounce",
+    "&tr=udp%3A%2F%2Ftracker.bittor.pw%3A1337%2Fannounce",
+    "&tr=udp%3A%2F%2Ftracker-udp.gbitt.info%3A80%2Fannounce",
+    "&tr=udp%3A%2F%2Ftracker.nyaa.vc%3A6969%2Fannounce",
+    "&tr=udp%3A%2F%2Ftracker.gmi.gd%3A6969%2Fannounce",
+    "&tr=udp%3A%2F%2Ftracker2.dler.org%3A80%2Fannounce",
+    "&tr=udp%3A%2F%2Ftracker.dler.org%3A6969%2Fannounce",
+    "&tr=http%3A%2F%2Ftracker2.dler.org%3A80%2Fannounce",
+    "&tr=http%3A%2F%2Ftracker.dler.com%3A6969%2Fannounce",
+    "&tr=http%3A%2F%2Ftracker.renfei.net%3A8080%2Fannounce",
+    "&tr=udp%3A%2F%2Ftracker.farted.net%3A6969%2Fannounce",
+    "&tr=udp%3A%2F%2Ftracker.peerfect.org%3A6969%2Fannounce",
+    "&tr=udp%3A%2F%2Ftracker.opentrackr.com%3A6969%2Fannounce",
+    "&tr=udp%3A%2F%2Ftracker.ilibr.org%3A6969%2Fannounce",
+    "&tr=udp%3A%2F%2Fmail.segso.net%3A6969%2Fannounce",
+    "&tr=https%3A%2F%2Ftracker.pmman.tech%3A443%2Fannounce",
+    "&tr=udp%3A%2F%2Ftracker.torrents.observer%3A80%2Fannounce",
+    "&tr=udp%3A%2F%2Ftracker.nyaa.net%3A6969%2Fannounce",
+    "&tr=udp%3A%2F%2Fopen.ftorrent.com%3A443%2Fannounce",
+    "&tr=udp%3A%2F%2Ftracker.aruku.ovh%3A8081%2Fannounce",
+);
+
+#[cfg(windows)]
+fn open_asset_torrent() -> std::io::Result<()> {
+    let target: Vec<u16> = ASSET_TORRENT_URL.encode_utf16().chain(Some(0)).collect();
+    let operation: Vec<u16> = "open".encode_utf16().chain(Some(0)).collect();
+    // Use the magnet protocol handler, rather than the default HTTP browser.
+    let result = unsafe {
+        windows_sys::Win32::UI::Shell::ShellExecuteW(
+            std::ptr::null_mut(),
+            operation.as_ptr(),
+            target.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+        )
+    } as isize;
+    if result <= 32 {
+        return Err(std::io::Error::other(format!(
+            "No torrent client could open the magnet link (Windows error {result})"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn open_asset_torrent() -> std::io::Result<()> {
+    let program = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    if !std::process::Command::new(program)
+        .arg(ASSET_TORRENT_URL)
+        .status()?
+        .success()
+    {
+        return Err(std::io::Error::other(
+            "No torrent client could open the magnet link",
+        ));
+    }
+    Ok(())
+}
+
+pub struct Launcher {
+    runtime: Option<tokio::runtime::Runtime>,
+    tx: mpsc::Sender<Event>,
+    rx: mpsc::Receiver<Event>,
+    folder: String,
+    settings: Settings,
+    code: String,
+    host: Option<Running>,
+    tunnel: Option<tunnel::Tunnel>,
+    host_addresses: Vec<std::net::Ipv4Addr>,
+    busy: bool,
+    status: String,
+    level: Level,
+    /// Set when the last failure produced a reportable fault.
+    fault: Option<Fault>,
+    tab: Tab,
+    join: String,
+    found: Vec<Found>,
+    scanning: bool,
+    /// The error report window is open.
+    fault_open: bool,
+    donate: bool,
+    donation_coin: Option<String>,
+    share: bool,
+    updates: bool,
+    obtain_assets: bool,
+    wallets: serde_json::Value,
+    smoke: bool,
+    created: Instant,
+    auto_open: bool,
+    screenshot: Option<PathBuf>,
+    screenshot_requested: bool,
+    console: Arc<ConsoleWindow>,
+    console_status: String,
+}
+
+impl Launcher {
+    pub fn new(
+        folder: PathBuf,
+        port: Option<u16>,
+        smoke: bool,
+        no_open: bool,
+        screenshot: Option<PathBuf>,
+    ) -> Self {
+        let (tx, rx) = mpsc::channel();
+        let mut app = Self {
+            runtime: Some(tokio::runtime::Runtime::new().expect("Create runtime")),
+            tx,
+            rx,
+            folder: folder.to_string_lossy().into(),
+            settings: Settings::default(),
+            code: String::new(),
+            host: None,
+            tunnel: None,
+            host_addresses: Vec::new(),
+            busy: false,
+            status: "Stopped".into(),
+            level: Level::Idle,
+            fault: None,
+            tab: Tab::Game,
+            join: String::new(),
+            found: Vec::new(),
+            scanning: false,
+            fault_open: false,
+            donate: false,
+            donation_coin: smoke.then(|| "solana".into()),
+            share: false,
+            updates: false,
+            obtain_assets: false,
+            wallets: serde_json::from_str(include_str!("../../donations/wallets.json"))
+                .expect("Bundled wallets JSON"),
+            smoke,
+            created: Instant::now(),
+            auto_open: !no_open && !smoke,
+            screenshot,
+            screenshot_requested: false,
+            console: Arc::new(ConsoleWindow {
+                open: AtomicBool::new(false),
+                follow: AtomicBool::new(true),
+                screenshot_requested: AtomicBool::new(false),
+            }),
+            console_status: String::new(),
+        };
+        if let Some(wallets) = app.wallets.as_array_mut() {
+            wallets.sort_by_key(|wallet| wallet["id"].as_str() != Some("solana"));
+        }
+        app.load();
+        if let Some(port) = port {
+            app.settings.port = port;
+        }
+        if smoke
+            && !(app.settings.cloudflare_tunnel && app.settings.mode == "external")
+            && config::resolve_folder(&PathBuf::from(&app.folder)).is_ok()
+        {
+            app.donate = false;
+            app.start(false);
+        }
+        app
+    }
+
+    // -- state helpers ------------------------------------------------------
+
+    /// Set the status line together with its severity.
+    fn set_status(&mut self, level: Level, text: impl Into<String>) {
+        self.level = level;
+        self.status = text.into();
+        if level != Level::Error {
+            self.fault = None;
+            self.fault_open = false;
+        }
+    }
+
+    /// Record a failure: status line, full report, and open the detail window.
+    fn fail(&mut self, fault: Fault) {
+        self.status = fault.summary.clone();
+        self.level = Level::Error;
+        gta_browser_launcher::diagnostics::record("Error", &fault.detail);
+        self.fault = Some(fault);
+        self.fault_open = true;
+    }
+
+    /// Whether the chosen folder currently resolves to a real game folder.
+    fn folder_state(&self) -> Result<PathBuf, Fault> {
+        config::resolve_folder(&PathBuf::from(&self.folder))
+            .map_err(|error| Fault::from_error("The game folder is not usable", &error))
+    }
+
+    fn folder_is_valid(&self) -> bool {
+        config::resolve_folder(&PathBuf::from(&self.folder)).is_ok()
+    }
+
+    fn load(&mut self) {
+        match config::resolve_folder(&PathBuf::from(&self.folder)) {
+            Ok(folder) => {
+                self.folder = folder.to_string_lossy().into();
+                match Settings::load(&folder) {
+                    Ok(s) => self.settings = s,
+                    Err(e) => {
+                        let fault = Fault::from_error("Could not read settings", &e);
+                        self.fail(fault);
+                    }
+                }
+                match config::load_code(&folder) {
+                    Ok(s) => self.code = s,
+                    Err(e) => {
+                        let fault = Fault::from_error("Could not read the access code", &e);
+                        self.fail(fault);
+                    }
+                }
+                if self.level != Level::Error {
+                    self.set_status(Level::Idle, "Ready — press Start server");
+                }
+            }
+            Err(error) => {
+                // A wrong folder is the most common first-run state, so report
+                // it in place rather than as a modal failure.
+                let fault = Fault::from_error("The game folder is not usable", &error);
+                self.level = Level::Warn;
+                self.status = fault.summary.clone();
+                self.fault = None;
+                self.fault_open = false;
+            }
+        }
+    }
+
+    // -- server control -----------------------------------------------------
+
+    fn start(&mut self, open_game: bool) {
+        if self.busy || self.host.is_some() {
+            return;
+        }
+        if let Err(fault) = self.folder_state() {
+            self.fail(fault);
+            return;
+        }
+        self.busy = true;
+        self.set_status(Level::Busy, "Starting server…");
+        let tx = self.tx.clone();
+        let folder = PathBuf::from(&self.folder);
+        let mut settings = self.settings.clone();
+        let quick_tunnel = settings.cloudflare_tunnel && settings.mode == "external";
+        let code = self.code.clone();
+        self.runtime.as_ref().unwrap().spawn(async move {
+            let result = async {
+                let previous = settings.clone();
+                if quick_tunnel {
+                    settings.https = false;
+                    settings.public_origin = "https://pending.invalid".into();
+                }
+                // Own the listener before publishing a tunnel, so a busy port cannot expose another app.
+                let mut host = server::start(&folder, settings, &code).await?;
+                let tunnel = if quick_tunnel {
+                    match tunnel::start(host.port()).await {
+                        Ok(tunnel) => {
+                            if let Err(error) = host.set_public_origin(&tunnel.origin) {
+                                tunnel.stop().await;
+                                host.stop().await;
+                                let _ = previous.save(&config::resolve_folder(&folder)?);
+                                return Err(error);
+                            }
+                            Some(tunnel)
                         }
                         Err(error) => {
-                            self.fail(Fault::from_error("Cannot create a certificate", &error));
+                            host.stop().await;
+                            let _ = previous.save(&config::resolve_folder(&folder)?);
+                            return Err(error);
                         }
                     }
-                }
-                theme::hint(
-                    ui,
-                    "LAN creates a private CA automatically. Trust is installed manually on each client.",
-                );
-            });
-
-            if !editable {
-                theme::note(
-                    ui,
-                    Level::Warn,
-                    "Stop the server before changing hosting settings.",
-                );
+                } else {
+                    None
+                };
+                Ok((host, tunnel))
             }
-            if !valid {
-                theme::note(
-                    ui,
-                    Level::Warn,
-                    "Select a valid game folder before starting the server.",
-                );
-            }
+            .await;
+            let _ = tx.send(Event::Started(result, open_game));
         });
-    }
-
-    fn network_tab(&mut self, ui: &mut egui::Ui) {
-        theme::section(ui, "Addresses");
-        let mut share_clicked = false;
-        let mut copy: Option<String> = None;
-        theme::wide_card(ui, |ui| {
-            let Some(host) = &self.host else {
-                theme::note(
-                    ui,
-                    Level::Idle,
-                    "No server is running. Start the server to see its addresses here.",
-                );
-                return;
-            };
-            let scheme = host.settings.scheme();
-            let port = host.port();
-
-            theme::value_row(
-                ui,
-                "Local",
-                &format!("{scheme}://localhost:{port}/launcher.html"),
-                &mut copy,
-            );
-            theme::value_row(
-                ui,
-                "Loopback",
-                &format!("{scheme}://127.0.0.1:{port}/launcher.html"),
-                &mut copy,
-            );
-
-            if host.settings.bind_ip().is_unspecified() {
-                if self.host_addresses.is_empty() {
-                    theme::note(
-                        ui,
-                        Level::Warn,
-                        "No IPv4 address was found, so other devices cannot connect.",
-                    );
-                }
-                for ip in &self.host_addresses {
-                    theme::value_row(
-                        ui,
-                        "Network",
-                        &format!("{scheme}://{ip}:{port}/launcher.html"),
-                        &mut copy,
-                    );
-                }
-            } else if host.settings.mode == "device" {
-                theme::note(
-                    ui,
-                    Level::Idle,
-                    "Network access is off. Select LAN / school network before starting to allow other devices.",
-                );
-            } else {
-                theme::note(
-                    ui,
-                    Level::Idle,
-                    "The backend listens on localhost; network clients connect through the configured public website.",
-                );
-            }
-
-            if !host.settings.public_origin.is_empty() {
-                theme::value_row(
-                    ui,
-                    "Public",
-                    &format!(
-                        "{}/launcher.html",
-                        host.settings.public_origin.trim_end_matches('/')
-                    ),
-                    &mut copy,
-                );
-            }
-
-            ui.add_space(theme::SPACE_S);
-            ui.label(
-                egui::RichText::new(format!(
-                    "Listener port: {}  •  Multiplayer: {}  •  Audience: {}",
-                    host.port(),
-                    if host.settings.multiplayer {
-                        "enabled"
-                    } else {
-                        "disabled"
-                    },
-                    match host.settings.mode.as_str() {
-                        "lan" => "LAN / school network",
-                        "external" => "Public website",
-                        _ => "This PC",
-                    }
-                ))
-                .size(theme::FONT_SMALL)
-                .color(theme::TEXT_DIM),
-            );
-
-            ui.horizontal_wrapped(|ui| {
-                if host.settings.mode != "device"
-                    && theme::button_w(ui, "Share game link", 170.).clicked()
-                {
-                    share_clicked = true;
-                }
-                if host.settings.multiplayer
-                    && theme::button_w(ui, "Copy access code", 170.).clicked()
-                {
-                    let code = host.code.clone();
-                    ui.ctx().copy_text(code);
-                }
-                if theme::button_w(ui, "Open game", 130.).clicked() {
-                    let _ = webbrowser::open(&host.url());
-                }
-            });
-            if !host.fingerprint().is_empty() {
-                ui.add_space(theme::SPACE_S);
-                theme::hint(
-                    ui,
-                    format!(
-                        "LAN root CA SHA-256: {} — share only lan-root-ca.cer, never a .key file.",
-                        host.fingerprint()
-                    ),
-                );
-            }
-        });
-        if let Some(value) = copy {
-            ui.ctx().copy_text(value);
-        }
-        if share_clicked {
-            self.share = true;
-        }
-    }
-
-    fn help_tab(&mut self, ui: &mut egui::Ui) {
-        theme::section(ui, "When something goes wrong");
-        theme::wide_card(ui, |ui| {
-            ui.label(
-                egui::RichText::new(
-                    "Failures appear as a red status line with an Error details button. That window shows the exact error, the likely cause and the steps that fix it.",
-                )
-                .size(theme::FONT_BODY)
-                .color(theme::TEXT_DIM),
-            );
-            ui.add_space(theme::SPACE_S);
-            theme::hint(
-                ui,
-                "Console output keeps the full log. Use Copy output there when asking for help.",
-            );
-        });
-
-        ui.add_space(theme::SPACE_L);
-        theme::section(ui, "Quick fixes for common failures");
-        for (title, steps) in GUIDE {
-            theme::wide_card(ui, |ui| {
-                egui::CollapsingHeader::new(
-                    egui::RichText::new(*title)
-                        .size(theme::FONT_BODY)
-                        .strong()
-                        .color(theme::TEXT),
-                )
-                .id_salt(*title)
-                .show(ui, |ui| {
-                    ui.add_space(theme::SPACE_XS);
-                    for (index, step) in steps.iter().enumerate() {
-                        ui.horizontal_top(|ui| {
-                            ui.label(
-                                egui::RichText::new(format!("{}.", index + 1))
-                                    .size(theme::FONT_SMALL)
-                                    .strong()
-                                    .color(theme::ACCENT),
-                            );
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(*step)
-                                        .size(theme::FONT_SMALL)
-                                        .line_height(Some(theme::LINE_BODY))
-                                        .color(theme::TEXT),
-                                )
-                                .wrap(),
-                            );
-                        });
-                        ui.add_space(theme::SPACE_XS);
-                    }
-                });
-            });
-            ui.add_space(theme::SPACE_S);
-        }
-
-        ui.add_space(theme::SPACE_L);
-        theme::section(ui, "Project links");
-        theme::wide_card(ui, |ui| {
-            let mut failed: Option<(String, String)> = None;
-            ui.horizontal_wrapped(|ui| {
-                for (label, url) in [
-                    ("Telegram", "https://t.me/reGRANDTA"),
-                    ("Discord", "https://discord.gg/hrbcPjjZfj"),
-                    ("GitHub", "https://github.com/SebasKitten/Grand-V"),
-                ] {
-                    if theme::button_w(ui, label, 150.).clicked()
-                        && let Err(error) = webbrowser::open(url)
-                    {
-                        failed = Some((label.to_owned(), error.to_string()));
-                    }
-                }
-            });
-            ui.add_space(theme::SPACE_S);
-            theme::hint(
-                ui,
-                "This launcher is provided for educational purposes only and distributes no game assets.",
-            );
-            if let Some((label, error)) = failed {
-                self.fail(Fault::new(
-                    format!("Could not open {label}: {error}"),
-                    error,
-                    Remedy::Unknown,
-                ));
-            }
-        });
-    }
-
-    fn layout(&mut self, ctx: &egui::Context) {
-        self.events();
-        if self.console_status != self.status {
-            gta_browser_launcher::diagnostics::record("Launcher", &self.status);
-            self.console_status = self.status.clone();
-        }
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    ui.add_space(theme::SPACE_M);
-                    ui.horizontal(|ui| {
-                        ui.add_space(theme::SPACE_M);
-                        ui.vertical(|ui| {
-                            ui.set_max_width(1020.);
-                            self.header(ui);
-
-                            ui.add_space(theme::SPACE_L);
-                            let labels: Vec<&str> = Tab::ALL.iter().map(|t| t.label()).collect();
-                            let chosen = theme::tabs(ui, &labels, self.tab as usize);
-                            self.tab = Tab::from_index(chosen);
-                            ui.add_space(theme::SPACE_M);
-
-                            match self.tab {
-                                Tab::Game => self.game_tab(ui),
-                                Tab::Server => self.server_tab(ui),
-                                Tab::Network => self.network_tab(ui),
-                                Tab::Help => self.help_tab(ui),
-                            }
-                            ui.add_space(theme::SPACE_XL);
-                        });
-                    });
-                });
-        });
-
-        self.obtain_assets_window(ctx);
-        self.updates_window(ctx);
-        self.share_window(ctx);
-        self.fault_window(ctx);
-        self.donate_window(ctx);
-        self.show_console(ctx);
     }
