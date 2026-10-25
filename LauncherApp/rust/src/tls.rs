@@ -25,7 +25,7 @@ fn signing_key(path: &Path) -> Result<KeyPair> {
         rustls::pki_types::PrivateKeyDer::Pkcs1(key) => {
             // Python writes TraditionalOpenSSL RSA keys. Wrap, do not replace, the existing key as PKCS#8 for rcgen/ring.
             let pkcs8 = yasna::construct_der(|w| {
-                w.sequence(|w| {
+                w.write_sequence(|w| {
                     w.next().write_u8(0);
                     w.next().write_sequence(|w| {
                         w.next()
